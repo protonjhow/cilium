@@ -207,6 +207,31 @@ func reverseRule(rule string) ([]string, error) {
 	return []string{}, nil
 }
 
+// ruleHasMalformedAddrs reports whether any IP address argument in a parsed rule
+// slice has host bits set (e.g. "99.105.108.105/24" instead of "99.105.108.0/24").
+//
+// Cilium never writes CIDRs with host bits, so a host-bits-set address is the
+// fingerprint of a rule that iptables-nft 1.8.10 misread from kernel nft state
+// written by 1.8.8: the two versions emit nft expressions in different order,
+// causing 1.8.10 to read the oifname bytes (e.g. "cilium_+") as a destination
+// IP address, yielding a malformed value like "99.105.108.105" (ASCII "cili").
+func ruleHasMalformedAddrs(rule []string) bool {
+	ipFlags := []string{"-s", "--source", "--src", "-d", "--destination", "--dst"}
+	for i := 0; i+1 < len(rule); i++ {
+		if !slices.Contains(ipFlags, rule[i]) {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(rule[i+1])
+		if err != nil {
+			continue
+		}
+		if prefix != prefix.Masked() {
+			return true
+		}
+	}
+	return false
+}
+
 func ruleReferencesDisabledChain(disableIptablesFeederRules []string, rule string) (bool, string) {
 	for _, disabledChain := range disableIptablesFeederRules {
 		if strings.Contains(rule, " "+strings.ToUpper(disabledChain)+" ") {
@@ -267,6 +292,23 @@ func (m *Manager) removeCiliumRules(table string, prog runnable, match string) e
 		}
 
 		if len(reversedRule) > 0 {
+			// iptables-nft 1.8.10 changed the ordering of nft expressions for
+			// rules relative to 1.8.8 (IP match expressions now come before
+			// oifname). When 1.8.10 reads a rule written by 1.8.8 it misparses
+			// the oifname bytes (e.g. "cilium_+") as a destination IP address,
+			// producing a malformed value like "99.105.108.105" (ASCII "cili").
+			// Such a CIDR has host bits set, which Cilium never writes
+			// intentionally. Detect this upfront and skip the individual
+			// deletion: rules in Cilium-owned chains will be cleaned up by the
+			// subsequent c.remove() -> iptables -F flush regardless.
+			if ruleHasMalformedAddrs(reversedRule) && len(reversedRule) > 1 && strings.Contains(reversedRule[1], match) {
+				m.logger.Warn(
+					"Skipping rule with malformed IP address (iptables-nft version mismatch), chain will be flushed",
+					logfields.Chain, reversedRule[1],
+				)
+				continue
+			}
+
 			deleteRule := append([]string{"-t", table}, reversedRule...)
 			if err := prog.runProg(deleteRule); err != nil {
 				return err
